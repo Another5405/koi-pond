@@ -1,0 +1,377 @@
+<!doctype html><html><head><meta charset="utf-8"><title>錦鯉池</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="錦鯉池">
+<link rel="apple-touch-icon" href="icon.jpg">
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#06221f}
+canvas{position:fixed;left:0;top:0;width:100vw;height:100vh;display:block}
+html,body,canvas{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+#gear{position:fixed;right:calc(14px + env(safe-area-inset-right));bottom:calc(14px + env(safe-area-inset-bottom));width:46px;height:46px;border-radius:50%;border:0;
+  background:rgba(0,0,0,.28);color:#fff;font:22px/46px system-ui;opacity:.45;transition:opacity .4s;padding:0}
+#gear.idle{opacity:.12}
+#panel{position:fixed;right:calc(14px + env(safe-area-inset-right));bottom:calc(70px + env(safe-area-inset-bottom));width:min(300px,calc(100vw - 28px));box-sizing:border-box;padding:16px 18px;
+  border-radius:16px;background:rgba(10,24,22,.82);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);color:#e8f2ee;font:15px/1.4 system-ui,-apple-system,"PingFang TC",sans-serif;display:none}
+#panel.open{display:block}
+#panel .row{margin:0 0 14px}#panel .row:last-child{margin:0}
+#panel label{display:block;margin-bottom:6px;color:#a9c4bb;font-size:13px}
+#panel .seg{display:flex;gap:6px}#panel button{flex:1;min-height:40px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:inherit;font:inherit}
+#panel button.on{background:#3f8f74;border-color:#3f8f74}
+#panel input[type=range]{width:100%;accent-color:#3f8f74;height:32px}
+#panel .hint{color:#8aa79d;font-size:12px}
+</style></head><body>
+<canvas id="gl"></canvas><canvas id="top"></canvas>
+<button id="gear" aria-label="設定">⚙</button>
+<div id="panel">
+  <div class="row"><label>魚的數量：<b id="fishN"></b></label><input id="fish" type="range" min="1" max="15" step="1"></div>
+  <div class="row"><label>時段</label><div class="seg" id="scene"><button data-v="0">白天</button><button data-v="1">黃昏</button><button data-v="2">夜晚</button></div></div>
+  <div class="row"><label>睡蓮</label><div class="seg" id="lily"><button data-v="1">開</button><button data-v="0">關</button></div></div>
+  <div class="row" id="fsRow"><div class="seg"><button id="fs">全螢幕</button></div></div>
+  <div class="row hint">手指劃水起漣漪・點一下撒飼料・快速掃過魚會逃。<br>Safari「分享 → 加入主畫面」可全螢幕開啟。</div>
+</div>
+<script>
+// LV1 錦鯉池：自寫 WebGL2 水面（不用 shaders 庫：魚要在水面下被漣漪折射，庫不能拿每幀畫的 canvas 當材質）
+//   水下（池底＋魚＋影子）→ 2D canvas 半解析度 → 材質；漣漪高度場 CPU 波動方程 → 材質
+//   最終 shader：法線 → 折射水下、反射倒影（天空／雲／樹枝，菲涅耳）、焦散、高光
+//   水面上（睡蓮、飼料）另一層 2D canvas，不折射
+//   互動：游標劃水起漣漪、點擊撒飼料、游標快速掃過魚會逃；Lively 設定：fishCount／scene／lilyPads
+const CFG = { fishCount: 7, scene: 0, lilyPads: true };
+const Q = new URLSearchParams(location.search);
+const LS = "koiPond.v1";  // iPad 沒有 Lively 設定面板：改用頁內面板，記在 localStorage
+try { Object.assign(CFG, JSON.parse(localStorage.getItem(LS) || "{}")); } catch (e) {}
+if (Q.has("fish")) CFG.fishCount = +Q.get("fish"); if (Q.has("scene")) CFG.scene = +Q.get("scene"); if (Q.has("lily")) CFG.lilyPads = Q.get("lily") !== "0";
+CFG.fishCount = Math.max(1, Math.min(15, CFG.fishCount | 0 || 7)); CFG.scene = [0, 1, 2].includes(CFG.scene) ? CFG.scene : 0;
+const saveCfg = () => { try { localStorage.setItem(LS, JSON.stringify(CFG)); } catch (e) {} };
+// Safari 舊版 2D canvas 沒有 ctx.filter：改用「縮小再放大」當模糊
+const HAS_FILTER = !Q.has("nofilter") && (() => { const t = document.createElement("canvas").getContext("2d"); t.filter = "blur(2px)"; return t.filter === "blur(2px)"; })();
+const blurC = document.createElement("canvas"), bg = blurC.getContext("2d");
+function softDraw(g, src, alpha) {  // 把 src 以 alpha＋約 2px 模糊疊到 g（兩者同尺寸）
+  g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = alpha;
+  if (HAS_FILTER) { g.filter = "blur(2px)"; g.drawImage(src, 0, 0); }
+  else { const w = Math.max(1, src.width >> 2), h = Math.max(1, src.height >> 2); if (blurC.width !== w || blurC.height !== h) { blurC.width = w; blurC.height = h; }
+    bg.clearRect(0, 0, w, h); bg.imageSmoothingQuality = "high"; bg.drawImage(src, 0, 0, w, h); g.imageSmoothingQuality = "high"; g.drawImage(blurC, 0, 0, src.width, src.height); }
+  g.restore();
+}
+const SCENES = [  // 天空上／下、雲、樹影、水色、水下亮度、菲涅耳、光色、焦散強度
+  { name: "白天", skyT: "#7fb8ec", skyB: "#d9ecff", cloud: "rgba(255,255,255,0.75)", tree: "#0c2014", tint: [0.03, 0.17, 0.16], gain: 1.0, fres: 0.2, light: [1, 0.98, 0.9], caus: 0.32, shade: null },
+  { name: "黃昏", skyT: "#3d2a5c", skyB: "#ffb070", cloud: "rgba(255,190,150,0.6)", tree: "#140a10", tint: [0.12, 0.08, 0.08], gain: 0.82, fres: 0.26, light: [1, 0.7, 0.45], caus: 0.2, shade: "rgba(90,40,30,0.38)" },
+  { name: "夜晚", skyT: "#02040c", skyB: "#0b1630", cloud: "rgba(60,80,120,0.25)", tree: "#000000", tint: [0.01, 0.04, 0.07], gain: 0.6, fres: 0.3, light: [0.75, 0.85, 1], caus: 0.06, shade: "rgba(0,12,35,0.62)" },
+];
+const DPR = Math.min(devicePixelRatio || 1, 2), UND = 0.5;  // UND：水下層解析度比例（會被折射糊掉，半解析度看不出來）
+let W, H, S;  // CSS px
+const gl = document.getElementById("gl").getContext("webgl2", { antialias: false, alpha: false });
+const top2 = document.getElementById("top").getContext("2d");
+const under = document.createElement("canvas"), ug = under.getContext("2d");
+const floorC = document.createElement("canvas"), fg = floorC.getContext("2d");
+const shadC = document.createElement("canvas"), sg2 = shadC.getContext("2d");  // 影子先用不透明黑畫在這層，再整層固定透明度疊上（半透明橢圓重疊會深淺不均）
+const reflC = document.createElement("canvas"), rg = reflC.getContext("2d");
+const rnd = (a, b) => a + Math.random() * (b - a);
+window.__state = gl ? "ready" : "error: no WebGL2";
+
+// ── 漣漪高度場（CPU 波動方程）──
+let GW, GH, hA, hB, hU8;
+function initGrid() { GW = 300; GH = Math.round(GW * H / W); hA = new Float32Array(GW * GH); hB = new Float32Array(GW * GH); hU8 = new Uint8Array(GW * GH); }
+function drop(x, y, r, amp) {  // x,y：CSS px
+  const gx = x / W * GW, gy = y / H * GH, R = Math.ceil(r);
+  for (let j = -R; j <= R; j++) for (let i = -R; i <= R; i++) {
+    const d = Math.hypot(i, j); if (d > r) continue; const X = gx + i | 0, Y = gy + j | 0;
+    if (X > 0 && Y > 0 && X < GW - 1 && Y < GH - 1) hA[Y * GW + X] += amp * (Math.cos(d / r * Math.PI) + 1) * 0.5; }
+}
+function stepWater() {
+  for (let y = 1; y < GH - 1; y++) for (let x = 1; x < GW - 1; x++) { const i = y * GW + x;
+    hB[i] = ((hA[i - 1] + hA[i + 1] + hA[i - GW] + hA[i + GW]) * 0.5 - hB[i]) * 0.986; }
+  const t = hA; hA = hB; hB = t;
+  for (let i = 0; i < hA.length; i++) { const v = 128 + hA[i] * 34; hU8[i] = v < 0 ? 0 : v > 255 ? 255 : v; }
+}
+const heightAt = (x, y) => { const X = Math.min(GW - 1, Math.max(0, x / W * GW | 0)), Y = Math.min(GH - 1, Math.max(0, y / H * GH | 0)); return hA[Y * GW + X]; };
+
+// ── 池底（靜態，畫一次）──
+function drawFloor() {
+  floorC.width = under.width = shadC.width = Math.round(W * DPR * UND); floorC.height = under.height = shadC.height = Math.round(H * DPR * UND);
+  const k = DPR * UND; fg.setTransform(k, 0, 0, k, 0, 0);
+  const gr = fg.createRadialGradient(W * 0.5, H * 0.55, S * 0.1, W * 0.5, H * 0.5, Math.hypot(W, H) * 0.6);
+  gr.addColorStop(0, "#5a7a62"); gr.addColorStop(0.6, "#3c5a4a"); gr.addColorStop(1, "#1d3029");
+  fg.fillStyle = gr; fg.fillRect(0, 0, W, H);
+  for (let i = 0; i < 9000; i++) {  // 細砂礫：小而多、低對比
+    const x = rnd(0, W), y = rnd(0, H), r = rnd(1, 4.5) * S / 900, l = rnd(30, 52), hue = rnd(30, 60);
+    fg.fillStyle = `hsla(${hue},${rnd(6, 16)}%,${l}%,${rnd(0.15, 0.4)})`;
+    fg.beginPath(); fg.ellipse(x, y, r, r * rnd(0.6, 0.95), rnd(0, Math.PI), 0, Math.PI * 2); fg.fill(); }
+  for (let i = 0; i < 90; i++) {  // 較大的石頭，稀疏
+    const x = rnd(0, W), y = rnd(0, H), r = rnd(10, 26) * S / 900, sg = fg.createRadialGradient(x - r * 0.3, y - r * 0.3, 0, x, y, r);
+    sg.addColorStop(0, `hsla(${rnd(30, 50)},12%,${rnd(48, 60)}%,0.55)`); sg.addColorStop(1, `hsla(40,10%,25%,0.35)`);
+    fg.fillStyle = sg; fg.beginPath(); fg.ellipse(x, y, r, r * rnd(0.6, 0.9), rnd(0, 3.14), 0, 6.28); fg.fill(); }
+  for (let i = 0; i < 40; i++) {  // 水草
+    const x = rnd(0, W), y = rnd(0, H), n = rnd(4, 9) | 0;
+    for (let k = 0; k < n; k++) { fg.strokeStyle = `rgba(${rnd(30, 60) | 0},${rnd(90, 130) | 0},${rnd(50, 70) | 0},0.5)`; fg.lineWidth = rnd(2, 4) * S / 900;
+      const a = rnd(0, Math.PI * 2), L = rnd(25, 70) * S / 900; fg.beginPath(); fg.moveTo(x, y);
+      fg.quadraticCurveTo(x + Math.cos(a) * L * 0.5 + rnd(-10, 10), y + Math.sin(a) * L * 0.5 + rnd(-10, 10), x + Math.cos(a) * L, y + Math.sin(a) * L); fg.stroke(); } }
+  const v = fg.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.hypot(W, H) * 0.55);  // 邊緣較深
+  v.addColorStop(0, "rgba(0,0,0,0)"); v.addColorStop(1, "rgba(0,10,8,0.6)"); fg.fillStyle = v; fg.fillRect(0, 0, W, H);
+}
+
+// ── 倒影：天空＋雲＋從畫面邊緣伸進來的樹枝（看水面時倒映的頭頂）──
+function drawRefl() {
+  const sc = SCENES[CFG.scene]; reflC.width = Math.round(W * DPR * 0.5); reflC.height = Math.round(H * DPR * 0.5);
+  const k = DPR * 0.5; rg.setTransform(k, 0, 0, k, 0, 0);
+  const sky = rg.createLinearGradient(0, 0, W * 0.3, H); sky.addColorStop(0, sc.skyT); sky.addColorStop(1, sc.skyB);
+  rg.fillStyle = sky; rg.fillRect(0, 0, W, H);
+  if (CFG.scene === 2) {  // 夜：星星＋月亮
+    for (let i = 0; i < 300; i++) { rg.fillStyle = `rgba(255,255,255,${rnd(0.2, 0.9)})`; rg.fillRect(rnd(0, W), rnd(0, H), 1.2, 1.2); }
+    const mx = W * 0.62, my = H * 0.38, mr = S * 0.045, mg = rg.createRadialGradient(mx, my, mr * 0.5, mx, my, mr * 5);
+    mg.addColorStop(0, "rgba(220,230,255,0.5)"); mg.addColorStop(1, "rgba(220,230,255,0)"); rg.fillStyle = mg; rg.fillRect(0, 0, W, H);
+    rg.fillStyle = "#eef2ff"; rg.beginPath(); rg.arc(mx, my, mr, 0, Math.PI * 2); rg.fill();
+  }
+  for (let i = 0; i < 18; i++) {  // 雲
+    const x = rnd(0, W), y = rnd(0, H), r = rnd(0.08, 0.2) * S, g2 = rg.createRadialGradient(x, y, 0, x, y, r);
+    g2.addColorStop(0, sc.cloud); g2.addColorStop(1, "rgba(255,255,255,0)"); rg.fillStyle = g2;
+    rg.beginPath(); rg.ellipse(x, y, r * 1.8, r, rnd(-0.3, 0.3), 0, Math.PI * 2); rg.fill(); }
+  const trees = document.createElement("canvas"); trees.width = reflC.width; trees.height = reflC.height;
+  const tg = trees.getContext("2d"); tg.setTransform(k, 0, 0, k, 0, 0); tg.strokeStyle = tg.fillStyle = sc.tree; tg.lineCap = "round";
+  const branch = (x, y, a, len, w, d) => {
+    const x2 = x + Math.cos(a) * len, y2 = y + Math.sin(a) * len;
+    tg.lineWidth = w; tg.beginPath(); tg.moveTo(x, y); tg.quadraticCurveTo((x + x2) / 2 + rnd(-len, len) * 0.15, (y + y2) / 2 + rnd(-len, len) * 0.15, x2, y2); tg.stroke();
+    if (d <= 1) for (let i = 0; i < 9; i++) { const r = rnd(3, 7) * S / 900, a = rnd(0, 6.28), dd = rnd(0.2, 1) * len * 0.5; tg.beginPath();
+      tg.ellipse(x2 + Math.cos(a) * dd, y2 + Math.sin(a) * dd, r * 2, r, a, 0, Math.PI * 2); tg.fill(); }
+    if (d > 0) for (let i = 0; i < 2 + (Math.random() < 0.4); i++) branch(x2, y2, a + rnd(-0.6, 0.6), len * rnd(0.6, 0.78), w * 0.68, d - 1);
+  };
+  branch(-20, -20, 0.75, S * 0.24, 14 * S / 900, 5); branch(W + 20, -10, 2.35, S * 0.22, 12 * S / 900, 5);
+  branch(-30, H * 0.85, -0.5, S * 0.17, 10 * S / 900, 4);
+  softDraw(rg, trees, CFG.scene === 2 ? 0.9 : 0.7);  // 倒影：半透明＋柔邊
+}
+
+// ── 錦鯉 ──
+const PATTERNS = [  // [底色, 斑色, 第二斑色]
+  ["#f4f1ea", "#e2471f", null], ["#f4f1ea", "#d9361c", "#1a1a1a"], ["#f2c14e", "#f7d77a", null],
+  ["#1c1c1c", "#d63c1c", "#f2efe6"], ["#8c6a46", "#a8845c", null], ["#f4f1ea", "#f08a1c", null],
+];
+const NSEG = 10;
+function makeFish() {
+  const len = rnd(0.17, 0.25) * S, pat = PATTERNS[Math.random() * PATTERNS.length | 0];
+  const f = { x: rnd(W * 0.2, W * 0.8), y: rnd(H * 0.2, H * 0.8), a: rnd(0, Math.PI * 2), v: rnd(0.5, 0.8), base: rnd(0.5, 0.8), len, ph: rnd(0, 9), flee: 0,
+    depth: rnd(0.55, 1), pat, spots: [], P: [] };
+  for (let i = 0; i < NSEG; i++) f.P.push([f.x - Math.cos(f.a) * i * len / NSEG, f.y - Math.sin(f.a) * i * len / NSEG]);
+  for (let i = 0; i < 7; i++) f.spots.push({ seg: rnd(0.5, NSEG - 2.5), side: rnd(-0.55, 0.55), r: rnd(0.35, 0.8), c: pat[2] && Math.random() < 0.35 ? pat[2] : pat[1] });
+  return f;
+}
+let FISH = [], PADS = [], FOOD = [];
+const widthAt = (f, i) => f.len * 0.12 * Math.pow(Math.sin(Math.PI * (i + 1.3) / (NSEG + 1.6)), 0.75);
+function drawFish(g, f, shadow) {
+  const P = f.P, ang = i => Math.atan2(P[Math.max(0, i - 1)][1] - P[Math.min(NSEG - 1, i + 1)][1], P[Math.max(0, i - 1)][0] - P[Math.min(NSEG - 1, i + 1)][0]);
+  const off = shadow ? [f.len * 0.16 * f.depth, f.len * 0.24 * f.depth] : [0, 0];
+  g.save(); g.translate(off[0], off[1]);
+  const flap = Math.sin(f.ph * 1.7) * 0.35;
+  // 尾鰭、胸鰭（半透明）
+  const tl = P[NSEG - 1], ta = ang(NSEG - 1), sw = Math.sin(f.ph) * 0.5;
+  g.fillStyle = shadow ? "#000" : hexA(f.pat[0], 0.55);
+  g.save(); g.translate(tl[0], tl[1]); g.rotate(ta + Math.PI + sw);
+  g.beginPath(); g.moveTo(0, 0); g.quadraticCurveTo(f.len * 0.2, -f.len * 0.16, f.len * 0.26, -f.len * 0.12); g.quadraticCurveTo(f.len * 0.16, 0, f.len * 0.26, f.len * 0.12); g.quadraticCurveTo(f.len * 0.2, f.len * 0.16, 0, 0); g.fill(); g.restore();
+  for (const s of [-1, 1]) { const p = P[2], a = ang(2); g.save(); g.translate(p[0], p[1]); g.rotate(a + s * (2.2 + flap * s));
+    g.beginPath(); g.ellipse(f.len * 0.09, 0, f.len * 0.1, f.len * 0.045, 0, 0, Math.PI * 2); g.fill(); g.restore(); }
+  // 身體：沿脊椎畫一串橢圓
+  g.fillStyle = shadow ? "#000" : f.pat[0];
+  for (let i = NSEG - 1; i >= 0; i--) { const p = P[i], w = widthAt(f, i); g.beginPath(); g.ellipse(p[0], p[1], w * 1.25, w, ang(i), 0, Math.PI * 2); g.fill(); }
+  if (!shadow) {
+    for (const sp of f.spots) { const i = Math.floor(sp.seg), t = sp.seg - i, a = P[i], b = P[i + 1], w = widthAt(f, i), an = ang(i);
+      const x = a[0] + (b[0] - a[0]) * t - Math.sin(an) * sp.side * w, y = a[1] + (b[1] - a[1]) * t + Math.cos(an) * sp.side * w;
+      g.fillStyle = sp.c; g.beginPath(); g.ellipse(x, y, w * sp.r * 1.3, w * sp.r, an, 0, Math.PI * 2); g.fill(); }
+    const h = P[0], an = ang(0), w = widthAt(f, 0);  // 眼睛
+    g.fillStyle = "#111"; for (const s of [-1, 1]) { g.beginPath(); g.arc(h[0] + Math.cos(an) * w * 0.4 - Math.sin(an) * s * w * 0.75, h[1] + Math.sin(an) * w * 0.4 + Math.cos(an) * s * w * 0.75, w * 0.14, 0, Math.PI * 2); g.fill(); }
+  }
+  g.restore();
+}
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${n >> 8 & 255},${n & 255},${a})`; }
+const angDiff = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+function updateFish(dt, now) {
+  const m = S * 0.1;
+  for (const f of FISH) {
+    let dx = Math.cos(f.a), dy = Math.sin(f.a), want = f.a + Math.sin(now * 0.0004 + f.ph * 3) * 0.6;  // 閒逛
+    let tx = 0, ty = 0;
+    if (f.x < m) tx += 1; if (f.x > W - m) tx -= 1; if (f.y < m) ty += 1; if (f.y > H - m) ty -= 1;  // 遠離池邊
+    for (const o of FISH) if (o !== f) { const ex = f.x - o.x, ey = f.y - o.y, d = Math.hypot(ex, ey); if (d < f.len * 0.9) { tx += ex / d * 0.6; ty += ey / d * 0.6; } }
+    let speed = f.base;
+    let food = null, fd = S * 0.55; for (const p of FOOD) { const d = Math.hypot(p.x - f.x, p.y - f.y); if (d < fd) { fd = d; food = p; } }
+    if (food) { tx += (food.x - f.x) / fd * 2; ty += (food.y - f.y) / fd * 2; speed *= 1.7;
+      if (fd < f.len * 0.12) { FOOD.splice(FOOD.indexOf(food), 1); drop(food.x, food.y, 3, -2.2); } }
+    const cd = Math.hypot(f.x - mx, f.y - my);  // 受驚：游標快速掃過附近
+    if (mSpeed > 14 && cd < S * 0.22) f.flee = 60;
+    if (f.flee > 0) { f.flee -= dt; tx += (f.x - mx) / (cd + 1) * 3; ty += (f.y - my) / (cd + 1) * 3; speed *= 3; }
+    if (tx || ty) want = Math.atan2(dy * 0.4 + ty, dx * 0.4 + tx);
+    f.a += Math.max(-0.045, Math.min(0.045, angDiff(f.a, want))) * dt;
+    f.v += (speed - f.v) * 0.04 * dt; const v = f.v * S / 900 * dt;
+    f.ph += f.v * 0.18 * dt; const wig = Math.sin(f.ph) * 0.06;
+    f.x += Math.cos(f.a + wig) * v; f.y += Math.sin(f.a + wig) * v;
+    const L = f.len / NSEG; f.P[0] = [f.x, f.y];
+    for (let i = 1; i < NSEG; i++) { const a = f.P[i - 1], b = f.P[i], ex = b[0] - a[0], ey = b[1] - a[1], d = Math.hypot(ex, ey) || 1; f.P[i] = [a[0] + ex / d * L, a[1] + ey / d * L]; }
+    if (f.flee > 50 && Math.random() < 0.15) drop(f.P[NSEG - 1][0], f.P[NSEG - 1][1], 2, 0.8);  // 甩尾濺水
+    if (Math.random() < 0.0012 * dt) drop(f.x + Math.cos(f.a) * f.len * 0.08, f.y + Math.sin(f.a) * f.len * 0.08, 2, -1.2);  // 偶爾浮上來親水面
+  }
+}
+
+// ── 睡蓮、飼料（水面上）──
+function makePads() { PADS = []; for (let i = 0; i < 6; i++) PADS.push({ x: rnd(0, W), y: rnd(0, H), r: rnd(0.035, 0.06) * S, a: rnd(0, 6.28), va: rnd(-1, 1) * 0.0004, vx: 0, vy: 0, notch: rnd(0, 6.28), flower: Math.random() < 0.3 }); }
+function drawPad(g, p, shadow) {
+  g.save(); g.translate(p.x + (shadow ? p.r * 0.35 : 0), p.y + (shadow ? p.r * 0.5 : 0)); g.rotate(p.a);
+  g.fillStyle = shadow ? "#000" : "#457a3a";
+  g.beginPath(); g.moveTo(0, 0); g.arc(0, 0, p.r, p.notch + 0.18, p.notch - 0.18 + Math.PI * 2); g.closePath(); g.fill();
+  if (!shadow) {
+    g.strokeStyle = "rgba(160,210,120,0.35)"; g.lineWidth = 1.2 * DPR;
+    for (let k = 0; k < 9; k++) { const a = p.notch + 0.4 + k * 0.62; g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(a) * p.r * 0.9, Math.sin(a) * p.r * 0.9); g.stroke(); }
+    const hl = g.createRadialGradient(-p.r * 0.3, -p.r * 0.3, 0, 0, 0, p.r); hl.addColorStop(0, "rgba(255,255,255,0.15)"); hl.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = hl; g.beginPath(); g.arc(0, 0, p.r, 0, Math.PI * 2); g.fill();
+    if (p.flower) for (let k = 0; k < 8; k++) { const a = k / 8 * 6.28; g.fillStyle = k % 2 ? "#f6d3e4" : "#fbe9f1";
+      g.beginPath(); g.ellipse(Math.cos(a) * p.r * 0.22, Math.sin(a) * p.r * 0.22, p.r * 0.26, p.r * 0.1, a, 0, 6.28); g.fill(); }
+    if (p.flower) { g.fillStyle = "#f7d046"; g.beginPath(); g.arc(0, 0, p.r * 0.09, 0, 6.28); g.fill(); }
+  }
+  g.restore();
+}
+function updatePads(dt) {
+  for (const p of PADS) {  // 被漣漪推著漂
+    const e = 4, gx = heightAt(p.x + e, p.y) - heightAt(p.x - e, p.y), gy = heightAt(p.x, p.y + e) - heightAt(p.x, p.y - e);
+    p.vx = (p.vx - gx * 0.25) * 0.985; p.vy = (p.vy - gy * 0.25) * 0.985; p.x += p.vx * dt; p.y += p.vy * dt; p.a += p.va * dt * 16;
+    if (p.x < -p.r) p.x = W + p.r; if (p.x > W + p.r) p.x = -p.r; if (p.y < -p.r) p.y = H + p.r; if (p.y > H + p.r) p.y = -p.r;
+  }
+  for (const f of FOOD) { f.t += dt; f.x += Math.sin(f.t * 0.02 + f.s) * 0.05; }
+  FOOD = FOOD.filter(f => f.t < 60 * 40);
+}
+
+// ── 輸入（觸控＋滑鼠）──
+let mx = -9999, my = -9999, mSpeed = 0;
+const PTR = new Map();  // pointerId → { x, y, x0, y0, t0, moved }
+function feed(x, y) { drop(x, y, 4, 4);
+  for (let i = 0; i < 6; i++) { const a = rnd(0, 6.28), r = rnd(0, S * 0.04); FOOD.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, t: 0, s: rnd(0, 9) }); } }
+function stroke(p, x, y) {
+  const d = Math.hypot(x - p.x, y - p.y); mSpeed = Math.max(mSpeed, d);
+  if (d > 1) { const n = Math.min(6, Math.ceil(d / 12)); for (let k = 1; k <= n; k++) drop(p.x + (x - p.x) * k / n, p.y + (y - p.y) * k / n, 2.2, Math.min(1.6, d * 0.05)); }
+  p.x = x; p.y = y; p.moved = Math.max(p.moved, Math.hypot(x - p.x0, y - p.y0)); mx = x; my = y;
+}
+const onWater = e => e.target === top2.canvas || e.target === gl.canvas || e.target === document.body;
+addEventListener("pointerdown", e => { if (!onWater(e)) return; closePanel();
+  PTR.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now(), moved: 0 });
+  mx = e.clientX; my = e.clientY; drop(e.clientX, e.clientY, 2.5, 1.2); wake(); });
+addEventListener("pointermove", e => {
+  let p = PTR.get(e.pointerId);
+  if (!p) { if (e.pointerType !== "mouse") return;  // 滑鼠沒按也起漣漪（桌機瀏覽器）
+    if (mx < -999) { mx = e.clientX; my = e.clientY; } p = { x: mx, y: my, x0: e.clientX, y0: e.clientY, moved: 0 }; }
+  for (const ev of e.getCoalescedEvents ? e.getCoalescedEvents() : [e]) stroke(p, ev.clientX, ev.clientY);
+});
+function up(e) { const p = PTR.get(e.pointerId); if (!p) return; PTR.delete(e.pointerId);
+  if (e.type === "pointerup" && p.moved < 14 && performance.now() - p.t0 < 400) feed(p.x0, p.y0);
+  if (e.pointerType !== "mouse" && !PTR.size) { mx = my = -9999; } }  // 手指離開：魚不再躲一個看不見的游標
+addEventListener("pointerup", up); addEventListener("pointercancel", up);
+addEventListener("gesturestart", e => e.preventDefault()); addEventListener("contextmenu", e => e.preventDefault());
+let wakeLock = null;  // 當桌布擺著：螢幕不要自己暗掉（Safari 16.4+；切走再回來要重新要）
+async function wake() { try { if (navigator.wakeLock && !wakeLock) { wakeLock = await navigator.wakeLock.request("screen"); wakeLock.addEventListener("release", () => { wakeLock = null; }); } } catch (e) {} }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wake(); });
+
+// ── 設定面板 ──
+const $ = id => document.getElementById(id), panel = $("panel"), gear = $("gear");
+let idleT; const poke = () => { gear.classList.remove("idle"); clearTimeout(idleT); idleT = setTimeout(() => gear.classList.add("idle"), 4000); };
+function closePanel() { panel.classList.remove("open"); }
+function syncUI() { $("fish").value = CFG.fishCount; $("fishN").textContent = CFG.fishCount;
+  for (const b of $("scene").children) b.classList.toggle("on", +b.dataset.v === CFG.scene);
+  for (const b of $("lily").children) b.classList.toggle("on", (b.dataset.v === "1") === CFG.lilyPads); }
+gear.addEventListener("click", () => { panel.classList.toggle("open"); syncUI(); poke(); });
+$("fish").addEventListener("input", e => livelyPropertyListener("fishCount", e.target.value));
+$("scene").addEventListener("click", e => { if (e.target.dataset.v) livelyPropertyListener("scene", e.target.dataset.v); });
+$("lily").addEventListener("click", e => { if (e.target.dataset.v) livelyPropertyListener("lilyPads", e.target.dataset.v === "1"); });
+const fsEl = document.documentElement, fsReq = fsEl.requestFullscreen || fsEl.webkitRequestFullscreen;
+if (!fsReq || navigator.standalone) $("fsRow").style.display = "none";
+$("fs").addEventListener("click", () => { if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document); else fsReq.call(fsEl); });
+addEventListener("pointerdown", poke); poke();
+
+// ── WebGL 水面 ──
+const VS = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p, 0., 1.); }`;
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uUnder, uRefl, uH; uniform vec2 uRes, uTx; uniform float uT, uGain, uFres, uCaus; uniform vec3 uTint, uLight;
+out vec4 o;
+float caustic(vec2 uv, float t){  // 經典可平鋪水底焦散（Dave Hoskins 版改寫）
+  vec2 p = mod(uv * 6.2831, 6.2831) - 250.; vec2 i = p; float c = 1.;
+  for (int n = 0; n < 4; n++) { float tt = t * (1. - 3.5 / float(n + 1));
+    i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+    c += 1. / length(vec2(p.x / (sin(i.x + tt) / .005), p.y / (cos(i.y + tt) / .005))); }
+  c /= 4.; c = 1.17 - pow(c, 1.4); return pow(abs(c), 8.); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes; uv.y = 1. - uv.y;
+  float hx = texture(uH, uv + vec2(uTx.x, 0.)).r - texture(uH, uv - vec2(uTx.x, 0.)).r;
+  float hy = texture(uH, uv + vec2(0., uTx.y)).r - texture(uH, uv - vec2(0., uTx.y)).r;
+  vec3 n = normalize(vec3(-hx * 9., -hy * 9., 1.));
+  vec3 und = texture(uUnder, uv + n.xy * 0.03).rgb * uGain;
+  float asp = uRes.x / uRes.y;
+  und += caustic(vec2(uv.x * asp, uv.y) * 0.9 + n.xy * 0.4, uT * 0.35) * uCaus * vec3(0.85, 1., 0.9);
+  und = mix(und, uTint, 0.3);  // 水的顏色吸收
+  vec3 refl = texture(uRefl, uv + n.xy * 0.09).rgb;
+  float F = clamp(uFres + (1. - n.z) * 3., 0., 0.85);  // 斜面反射較多
+  vec3 col = mix(und, refl, F);
+  vec3 L = normalize(vec3(-0.4, -0.5, 1.)); vec3 R = reflect(-L, n);
+  col += uLight * pow(max(R.z, 0.), 350.) * 1.6 * smoothstep(0.0005, 0.01, 1. - n.z);  // 漣漪上的高光
+  o = vec4(col, 1.);
+}`;
+let prog, tUnder, tRefl, tH, U = {};
+function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; }
+function tex(filter) { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return t; }
+function initGL() {
+  prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS)); gl.linkProgram(prog); gl.useProgram(prog);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  for (const k of ["uUnder", "uRefl", "uH", "uRes", "uTx", "uT", "uGain", "uFres", "uCaus", "uTint", "uLight"]) U[k] = gl.getUniformLocation(prog, k);
+  tUnder = tex(gl.LINEAR); tRefl = tex(gl.LINEAR); tH = tex(gl.LINEAR);
+  gl.uniform1i(U.uUnder, 0); gl.uniform1i(U.uRefl, 1); gl.uniform1i(U.uH, 2); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+}
+function uploadRefl() { gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tRefl); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, reflC); }
+
+function resize() {
+  W = innerWidth; H = innerHeight; S = Math.min(W, H);
+  for (const c of [gl.canvas, top2.canvas]) { c.width = Math.round(W * DPR); c.height = Math.round(H * DPR); }
+  gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+  initGrid(); drawFloor(); drawRefl(); if (prog) uploadRefl();
+}
+function applyScene() { drawRefl(); uploadRefl(); }
+function setFish(n) { while (FISH.length < n) FISH.push(makeFish()); FISH.length = n; }
+
+let last = performance.now(), frames = [];
+window.__perf = { fps: 0 };
+function frame(now) {
+  const dt = Math.min(3, (now - last) / 16.67); last = now;
+  frames.push(now); while (frames[0] < now - 1000) frames.shift(); window.__perf.fps = frames.length;
+  mSpeed *= 0.85;
+  if (Math.random() < 0.01 * dt) drop(rnd(0, W), rnd(0, H), 1.5, rnd(-0.6, 0.6));  // 偶爾的小水紋
+  stepWater(); updateFish(dt, now); if (CFG.lilyPads) updatePads(dt);
+  // 水下層
+  const k = DPR * UND; ug.setTransform(1, 0, 0, 1, 0, 0); ug.drawImage(floorC, 0, 0); ug.setTransform(k, 0, 0, k, 0, 0);
+  sg2.setTransform(1, 0, 0, 1, 0, 0); sg2.clearRect(0, 0, shadC.width, shadC.height); sg2.setTransform(k, 0, 0, k, 0, 0);
+  for (const f of FISH) drawFish(sg2, f, true);
+  if (CFG.lilyPads) for (const p of PADS) drawPad(sg2, p, true);
+  softDraw(ug, shadC, 0.3);
+  for (const f of [...FISH].sort((a, b) => a.depth - b.depth)) { ug.globalAlpha = 0.55 + f.depth * 0.45; drawFish(ug, f, false); } ug.globalAlpha = 1;
+  // 上傳材質＋畫水面
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tUnder); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, under);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tH); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, GW, GH, 0, gl.RED, gl.UNSIGNED_BYTE, hU8);
+  const sc = SCENES[CFG.scene];
+  gl.uniform2f(U.uRes, gl.canvas.width, gl.canvas.height); gl.uniform2f(U.uTx, 1 / GW, 1 / GH); gl.uniform1f(U.uT, now / 1000);
+  gl.uniform1f(U.uGain, sc.gain); gl.uniform1f(U.uFres, sc.fres); gl.uniform1f(U.uCaus, sc.caus); gl.uniform3fv(U.uTint, sc.tint); gl.uniform3fv(U.uLight, sc.light);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 水面上層
+  top2.setTransform(1, 0, 0, 1, 0, 0); top2.clearRect(0, 0, top2.canvas.width, top2.canvas.height); top2.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (CFG.lilyPads) for (const p of PADS) drawPad(top2, p, false);
+  for (const f of FOOD) { top2.fillStyle = "#7a4a22"; top2.beginPath(); top2.arc(f.x, f.y, S * 0.004, 0, 6.28); top2.fill(); }
+  const sh2 = SCENES[CFG.scene].shade;  // 水面上的東西也要跟場景光線：只蓋在已畫的像素上
+  if (sh2) { top2.globalCompositeOperation = "source-atop"; top2.fillStyle = sh2; top2.fillRect(0, 0, W, H); top2.globalCompositeOperation = "source-over"; }
+  requestAnimationFrame(frame);
+}
+if (gl) {
+  resize(); initGL(); uploadRefl(); setFish(CFG.fishCount); makePads();
+  addEventListener("resize", () => { resize(); });
+  addEventListener("orientationchange", () => setTimeout(resize, 300));  // iPad 轉向時 innerWidth 會晚一點才更新
+  requestAnimationFrame(frame);
+}
+function livelyPropertyListener(name, val) {  // 名稱沿用 Lively 版；iPad 由頁內面板呼叫
+  if (name === "fishCount") { CFG.fishCount = +val; setFish(CFG.fishCount); }
+  else if (name === "scene") { CFG.scene = +val; applyScene(); }
+  else if (name === "lilyPads") CFG.lilyPads = !!val;
+  saveCfg(); syncUI();
+}
+</script></body></html>
